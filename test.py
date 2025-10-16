@@ -1,0 +1,1 @@
+print("khkt.1")
