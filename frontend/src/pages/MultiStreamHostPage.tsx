@@ -2,6 +2,11 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useAuth } from '../context/AuthContext';
 import { fetchLatestDetections, type DetectionRecord } from '../services/detectionService';
 import { createStreamSession, updateStreamSessionStatus } from '../services/streamService';
+import { getParkingLotsByOwner, addCameraToParkingLot } from '../services/parkingLotService';
+import { 
+  getUserESP32Configs,
+  type ESP32Config 
+} from '../services/esp32ConfigService';
 import {
   optimizeVideoQuality,
   optimizeVideoTrack,
@@ -10,7 +15,6 @@ import {
 
 const SIGNALING_URL = 'ws://localhost:3001';
 const ICE_SERVERS = [{ urls: 'stun:stun.l.google.com:19302' }];
-const PARKING_ID_REGEX = /^[A-Za-z0-9]+$/;
 
 type HostStatus = 'idle' | 'connecting' | 'streaming' | 'error';
 
@@ -251,6 +255,16 @@ function StreamHostTile({ id, parkingLotId, cameraId, ownerId, onRemove }: HostT
         });
         if (result.success && result.id) {
           streamSessionIdRef.current = result.id;
+        }
+        console.log(`[Host ${id}] Stream session created successfully`);
+        
+        // Add camera to parking lot cameras array
+        console.log(`[Host ${id}] Adding camera to parking lot...`);
+        const addCameraResult = await addCameraToParkingLot(parkingLotId.trim(), cameraId.trim());
+        if (addCameraResult.success) {
+          console.log(`[Host ${id}] ✅ Camera added to parking lot ${parkingLotId.trim()}`);
+        } else {
+          console.warn(`[Host ${id}] ⚠️ Failed to add camera to parking lot:`, addCameraResult.error);
         }
       } catch (logErr) {
         console.warn(`[Host ${id}] Failed to create stream session:`, logErr);
@@ -494,34 +508,50 @@ export function MultiStreamHostPage() {
   const ownerId = user?.uid ?? '';
 
   const [availableParkings, setAvailableParkings] = useState<string[]>([]);
-  const [availableCameras, setAvailableCameras] = useState<string[]>([]);
+  const [availableESP32Cameras, setAvailableESP32Cameras] = useState<ESP32Config[]>([]);
   const [parkingLotId, setParkingLotId] = useState('');
   const [cameraId, setCameraId] = useState('');
   const [parkingIdError, setParkingIdError] = useState<string | null>(null);
   const [cameraIdError, setCameraIdError] = useState<string | null>(null);
   const [tiles, setTiles] = useState<HostTileConfig[]>([]);
 
+  // Load ESP32 cameras from saved configs
+  useEffect(() => {
+    const loadESP32Cameras = async () => {
+      console.log('[MultiStreamHost] Loading ESP32 cameras for owner:', ownerId);
+      
+      if (!ownerId) {
+        console.log('[MultiStreamHost] No ownerId, skipping ESP32 camera load');
+        setAvailableESP32Cameras([]);
+        return;
+      }
+      
+      try {
+        const configs = await getUserESP32Configs(ownerId);
+        console.log('[MultiStreamHost] ✅ Loaded', configs.length, 'ESP32 cameras:', configs);
+        setAvailableESP32Cameras(configs);
+      } catch (err) {
+        console.error('[MultiStreamHost] ❌ Failed to load ESP32 cameras:', err);
+        setAvailableESP32Cameras([]);
+      }
+    };
+    
+    loadESP32Cameras();
+  }, [ownerId]);
+
   useEffect(() => {
     const load = async () => {
       if (!ownerId) {
         setAvailableParkings([]);
-        setAvailableCameras([]);
         return;
       }
       try {
-        const result = await fetchLatestDetections({ ownerId });
-        if (result.success && result.data) {
-          const parkings = new Set<string>();
-          const cameras = new Set<string>();
-          result.data.forEach((r: DetectionRecord) => {
-            if (r.parkingId) parkings.add(r.parkingId);
-            if (r.cameraId) cameras.add(r.cameraId);
-          });
-          setAvailableParkings(Array.from(parkings).sort());
-          setAvailableCameras(Array.from(cameras).sort());
-        }
+        // Load parking lots from database
+        const parkingLots = await getParkingLotsByOwner(ownerId);
+        const parkingIds = parkingLots.map(lot => lot.id).sort();
+        setAvailableParkings(parkingIds);
       } catch (err) {
-        console.error('Failed to load cameras for multi-host:', err);
+        console.error('Failed to load parking lots and cameras:', err);
       }
     };
     load();
@@ -530,10 +560,6 @@ export function MultiStreamHostPage() {
   const validateParkingId = (value: string) => {
     if (!value.trim()) {
       setParkingIdError('Parking Lot ID không được để trống');
-      return false;
-    }
-    if (!PARKING_ID_REGEX.test(value.trim())) {
-      setParkingIdError('Parking Lot ID chỉ được chứa chữ cái tiếng Anh và số, không dấu, không khoảng trắng');
       return false;
     }
     setParkingIdError(null);
@@ -545,21 +571,33 @@ export function MultiStreamHostPage() {
       setCameraIdError('Camera ID không được để trống');
       return false;
     }
-    if (!PARKING_ID_REGEX.test(value.trim())) {
-      setCameraIdError('Camera ID chỉ được chứa chữ cái tiếng Anh và số, không dấu, không khoảng trắng');
-      return false;
-    }
     setCameraIdError(null);
     return true;
   };
 
-  const handleAddTile = () => {
+  const handleAddTile = async () => {
     if (!validateParkingId(parkingLotId) || !validateCameraId(cameraId)) {
       return;
     }
     const lot = parkingLotId.trim();
     const cam = cameraId.trim();
     const id = `${lot}__${cam}__${Date.now()}`;
+    
+    // Add camera to parking lot immediately
+    console.log(`[MultiStreamHost] Adding camera ${cam} to parking lot ${lot}...`);
+    try {
+      const result = await addCameraToParkingLot(lot, cam);
+      if (result.success) {
+        console.log(`[MultiStreamHost] ✅ Camera ${cam} added to parking lot ${lot}`);
+      } else {
+        console.warn(`[MultiStreamHost] ⚠️ Failed to add camera:`, result.error);
+        alert(`⚠️ Không thể thêm camera vào parking lot: ${result.error}`);
+      }
+    } catch (error) {
+      console.error(`[MultiStreamHost] ❌ Error adding camera:`, error);
+      alert(`❌ Lỗi khi thêm camera: ${error}`);
+    }
+    
     setTiles((prev) => {
       const exists = prev.some((t) => t.parkingLotId === lot && t.cameraId === cam);
       if (exists) return prev;
@@ -579,7 +617,7 @@ export function MultiStreamHostPage() {
         <div>
           <h1 className="text-3xl font-bold text-gray-900">📹 Multi Stream Host</h1>
           <p className="text-gray-500 text-sm">
-            Host nhiều stream cùng lúc từ các video file khác nhau. Mỗi ô là một room riêng (Parking Lot ID + Camera ID).
+            Host camera streams để thêm camera vào parking lot. Sau khi host, camera sẽ tự động xuất hiện trong parking lot dashboard.
           </p>
         </div>
         {role !== 'admin' && (
@@ -589,79 +627,142 @@ export function MultiStreamHostPage() {
         )}
       </div>
 
+      {/* No Parking Lots Warning */}
+      {availableParkings.length === 0 && role === 'admin' && (
+        <div className="mb-6 bg-yellow-50 border-2 border-yellow-300 rounded-xl p-5">
+          <div className="flex items-start gap-3">
+            <span className="text-3xl">⚠️</span>
+            <div className="flex-1">
+              <h3 className="text-lg font-bold text-yellow-900 mb-2">
+                Chưa có bãi đỗ xe nào
+              </h3>
+              <p className="text-sm text-yellow-800 mb-3">
+                Bạn cần tạo bãi đỗ xe trước khi host camera streams.
+              </p>
+              <a
+                href="/parking-lots"
+                className="inline-flex items-center gap-2 px-4 py-2 bg-yellow-600 hover:bg-yellow-700 text-white rounded-lg font-semibold transition"
+              >
+                🏢 Đến trang Quản lý Bãi đỗ xe →
+              </a>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Debug Info Panel */}
+      {role === 'admin' && (
+        <details className="mb-6 bg-gray-50 border border-gray-300 rounded-lg p-4">
+          <summary className="cursor-pointer font-semibold text-gray-700 hover:text-blue-600">
+            🔍 Debug Info (Click to expand)
+          </summary>
+          <div className="mt-3 space-y-2 text-sm font-mono">
+            <div className="flex gap-2">
+              <span className="text-gray-600">Owner ID:</span>
+              <span className="text-blue-600">{ownerId || '(not logged in)'}</span>
+            </div>
+            <div className="flex gap-2">
+              <span className="text-gray-600">Parking Lots:</span>
+              <span className="text-green-600">{availableParkings.length} loaded</span>
+              {availableParkings.length > 0 && (
+                <span className="text-gray-500">({availableParkings.join(', ')})</span>
+              )}
+            </div>
+            <div className="flex gap-2">
+              <span className="text-gray-600">ESP32 Cameras:</span>
+              <span className="text-purple-600">{availableESP32Cameras.length} saved</span>
+            </div>
+            {availableESP32Cameras.length > 0 && (
+              <div className="mt-2 p-2 bg-white rounded border border-gray-200">
+                <div className="text-xs text-gray-600 mb-1">Saved ESP32 Cameras:</div>
+                {availableESP32Cameras.map((esp32, idx) => (
+                  <div key={esp32.id} className="text-xs text-gray-700 ml-2">
+                    {idx + 1}. 📹 {esp32.name} - {esp32.ipAddress} {esp32.isDefault && '⭐'}
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="mt-2 p-2 bg-blue-50 rounded border border-blue-200 text-xs text-blue-800">
+              💡 <strong>Troubleshooting:</strong> ESP32 cameras are loaded from the saved configs you add in /stream/multi
+            </div>
+          </div>
+        </details>
+      )}
+
       {/* Config add tile */}
       <div className="mb-6 bg-white border border-gray-200 rounded-2xl shadow-sm p-4">
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-end">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">
-              Parking Lot ID
+              Parking Lot ID {availableParkings.length > 0 && (
+                <span className="text-xs text-green-600 font-normal">
+                  ({availableParkings.length} bãi đỗ xe có sẵn)
+                </span>
+              )}
             </label>
-            <div className="flex gap-2">
-              <select
-                value={parkingLotId}
-                onChange={(e) => {
-                  setParkingLotId(e.target.value);
-                  validateParkingId(e.target.value);
-                }}
-                className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
-                disabled={role !== 'admin'}
-              >
-                <option value="">-- Chọn hoặc nhập mới --</option>
-                {availableParkings.map((p) => (
-                  <option key={p} value={p}>
-                    {p}
-                  </option>
-                ))}
-              </select>
-              <input
-                type="text"
-                value={parkingLotId}
-                onChange={(e) => {
-                  setParkingLotId(e.target.value);
-                  validateParkingId(e.target.value);
-                }}
-                placeholder="Nhập Parking Lot ID"
-                className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
-                disabled={role !== 'admin'}
-              />
-            </div>
+            <select
+              value={parkingLotId}
+              onChange={(e) => {
+                setParkingLotId(e.target.value);
+                validateParkingId(e.target.value);
+              }}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+              disabled={role !== 'admin'}
+            >
+              <option value="">-- Chọn Parking Lot --</option>
+              {availableParkings.map((p) => (
+                <option key={p} value={p}>
+                  {p}
+                </option>
+              ))}
+            </select>
+            {availableParkings.length === 0 && (
+              <p className="mt-1 text-xs text-orange-600">
+                ⚠️ Chưa có bãi đỗ xe nào. Tạo bãi mới tại{' '}
+                <a href="/parking-lots" className="underline font-semibold hover:text-orange-800">
+                  /parking-lots
+                </a>
+              </p>
+            )}
             {parkingIdError && (
               <p className="mt-1 text-xs text-red-600">{parkingIdError}</p>
             )}
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">
-              Camera ID
+              Camera ID {availableESP32Cameras.length > 0 && (
+                <span className="text-xs text-blue-600 font-normal">
+                  ({availableESP32Cameras.length} ESP32 camera đã lưu)
+                </span>
+              )}
             </label>
-            <div className="flex gap-2">
-              <select
-                value={cameraId}
-                onChange={(e) => {
-                  setCameraId(e.target.value);
-                  validateCameraId(e.target.value);
-                }}
-                className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
-                disabled={role !== 'admin'}
-              >
-                <option value="">-- Chọn hoặc nhập mới --</option>
-                {availableCameras.map((c) => (
-                  <option key={c} value={c}>
-                    {c}
-                  </option>
-                ))}
-              </select>
-              <input
-                type="text"
-                value={cameraId}
-                onChange={(e) => {
-                  setCameraId(e.target.value);
-                  validateCameraId(e.target.value);
-                }}
-                placeholder="Nhập Camera ID"
-                className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
-                disabled={role !== 'admin'}
-              />
-            </div>
+            <select
+              value={cameraId}
+              onChange={(e) => {
+                setCameraId(e.target.value);
+                validateCameraId(e.target.value);
+              }}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+              disabled={role !== 'admin'}
+              title="Chọn camera ESP32 đã lưu"
+            >
+              <option value="">-- Chọn ESP32 Camera --</option>
+              {availableESP32Cameras.map((esp32) => (
+                <option key={esp32.id} value={esp32.id}>
+                  📹 {esp32.name} ({esp32.ipAddress})
+                </option>
+              ))}
+            </select>
+            {availableESP32Cameras.length === 0 && ownerId && (
+              <p className="mt-1 text-xs text-red-600">
+                ⚠️ Chưa có ESP32 camera nào được lưu. Thêm camera ở <a href="/stream/multi" className="underline font-bold">/stream/multi</a> trước!
+              </p>
+            )}
+            {availableESP32Cameras.length > 0 && (
+              <p className="mt-1 text-xs text-blue-600">
+                ✅ Có {availableESP32Cameras.length} ESP32 camera đã lưu. Chọn từ dropdown.
+              </p>
+            )}
             {cameraIdError && (
               <p className="mt-1 text-xs text-red-600">{cameraIdError}</p>
             )}
@@ -680,10 +781,22 @@ export function MultiStreamHostPage() {
             </button>
           </div>
         </div>
-        <p className="mt-2 text-xs text-gray-500">
-          ID chỉ gồm chữ cái tiếng Anh và số, không dấu và không khoảng trắng. Một combo Parking Lot
-          + Camera chỉ được thêm một lần.
-        </p>
+        <div className="mt-3 p-3 bg-blue-50 border border-blue-200 rounded-lg">
+          <p className="text-xs text-blue-800">
+            <strong>💡 Hướng dẫn:</strong>
+          </p>
+          <ul className="mt-2 space-y-1 text-xs text-blue-700">
+            <li>• <strong>Parking Lot ID:</strong> Chọn từ dropdown (đã tạo tại <a href="/parking-lots" className="underline font-semibold">/parking-lots</a>)</li>
+            <li>• <strong>Camera ID:</strong> 
+              <ul className="ml-4 mt-1 space-y-0.5">
+                <li>→ Chọn từ dropdown để tái sử dụng camera đã cấu hình (tự động điền Parking Lot)</li>
+                <li>→ Hoặc nhập tên mới (VD: CAM1, ENTRANCE, EXIT)</li>
+              </ul>
+            </li>
+            <li>• Một combo Parking Lot + Camera chỉ được thêm một lần</li>
+            <li>• Camera ID chỉ gồm chữ cái và số, không dấu, không khoảng trắng</li>
+          </ul>
+        </div>
       </div>
 
       {/* Grid hosts */}
@@ -708,6 +821,109 @@ export function MultiStreamHostPage() {
           ))}
         </div>
       )}
+
+      {/* Step-by-Step Guide - BOTTOM */}
+      <div className="mt-8 mb-6 bg-gradient-to-r from-green-50 to-blue-50 border-2 border-green-300 rounded-xl p-5">
+        <div className="flex items-start gap-3">
+          <span className="text-3xl">🎯</span>
+          <div className="flex-1">
+            <h3 className="text-lg font-bold text-gray-900 mb-3">
+              📚 Cách thêm camera vào Parking Lot
+            </h3>
+            <div className="grid md:grid-cols-3 gap-4">
+              {/* Step 1 */}
+              <div className="bg-white rounded-lg p-4 border-2 border-blue-200">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="bg-blue-600 text-white rounded-full w-6 h-6 flex items-center justify-center text-sm font-bold">1</span>
+                  <span className="font-bold text-gray-800">Chọn Parking Lot</span>
+                </div>
+                <p className="text-xs text-gray-600 mb-2">
+                  Chọn bãi đỗ xe từ dropdown
+                </p>
+                <p className="text-xs text-blue-600">
+                  💡 Chưa có? Tạo tại <a href="/parking-lots" className="underline font-bold">/parking-lots</a>
+                </p>
+              </div>
+
+              {/* Step 2 */}
+              <div className="bg-white rounded-lg p-4 border-2 border-purple-200">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="bg-purple-600 text-white rounded-full w-6 h-6 flex items-center justify-center text-sm font-bold">2</span>
+                  <span className="font-bold text-gray-800">Chọn Camera</span>
+                </div>
+                <p className="text-xs text-gray-600 mb-2">
+                  Chọn ESP32 camera đã lưu từ dropdown
+                </p>
+                <p className="text-xs text-purple-600">
+                  💡 Lưu camera tại <a href="/stream/multi" className="underline font-bold">/stream/multi</a>
+                </p>
+              </div>
+
+              {/* Step 3 */}
+              <div className="bg-white rounded-lg p-4 border-2 border-green-200">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="bg-green-600 text-white rounded-full w-6 h-6 flex items-center justify-center text-sm font-bold">3</span>
+                  <span className="font-bold text-gray-800">Thêm Host</span>
+                </div>
+                <p className="text-xs text-gray-600 mb-2">
+                  Click "➕ Thêm host" → Chọn video → "Bắt đầu phát"
+                </p>
+                <p className="text-xs text-green-600">
+                  ✅ Camera tự động thêm vào parking lot!
+                </p>
+              </div>
+            </div>
+
+            {/* Result */}
+            <div className="mt-4 p-3 bg-yellow-50 border border-yellow-300 rounded-lg">
+              <p className="text-sm text-gray-800">
+                <strong>🎉 Kết quả:</strong> Camera xuất hiện tại{' '}
+                <a href="/parking-lots" className="text-blue-600 underline font-bold hover:text-blue-800">
+                  /parking-lots
+                </a>
+                {' '}→ Chọn bãi đỗ xe → Xem danh sách cameras! 
+                Xem tất cả tại{' '}
+                <a href="/stream/view-multi" className="text-blue-600 underline font-bold hover:text-blue-800">
+                  /stream/view-multi
+                </a>
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Quick Navigation - Bottom */}
+      <div className="mt-8 pt-6 border-t border-gray-200">
+        <div className="flex gap-3 overflow-x-auto pb-2">
+          <a
+            href="/parking-lots"
+            className="px-4 py-2 bg-white border-2 border-gray-300 rounded-lg hover:border-blue-500 hover:shadow-md transition flex items-center gap-2 whitespace-nowrap"
+          >
+            <span className="text-xl">🏢</span>
+            <div className="text-left">
+              <div className="text-xs text-gray-500">Bước 1</div>
+              <div className="font-semibold text-sm">Quản lý Bãi đỗ xe</div>
+            </div>
+          </a>
+          <div className="px-4 py-2 bg-gradient-to-r from-indigo-500 to-purple-500 text-white border-2 border-indigo-600 rounded-lg shadow-lg flex items-center gap-2 whitespace-nowrap">
+            <span className="text-xl">📹</span>
+            <div className="text-left">
+              <div className="text-xs opacity-90">Bước 2 (Đang ở đây)</div>
+              <div className="font-bold text-sm">Host Camera Streams</div>
+            </div>
+          </div>
+          <a
+            href="/stream/view-multi"
+            className="px-4 py-2 bg-white border-2 border-gray-300 rounded-lg hover:border-blue-500 hover:shadow-md transition flex items-center gap-2 whitespace-nowrap"
+          >
+            <span className="text-xl">👁️</span>
+            <div className="text-left">
+              <div className="text-xs text-gray-500">Bước 3</div>
+              <div className="font-semibold text-sm">Xem Live Streams</div>
+            </div>
+          </a>
+        </div>
+      </div>
     </div>
   );
 }
