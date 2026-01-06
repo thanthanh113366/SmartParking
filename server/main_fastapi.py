@@ -4,6 +4,7 @@ Modular architecture with separated routers and middleware
 """
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import uvicorn
 import os
 import sys
@@ -26,26 +27,24 @@ from services.stream_broadcaster import broadcast_manager
 from esp32_client import ESP32Client
 
 # Import routers
-from routers import health, user_config, streams, esp32, ai_detection, firebase, websocket_streams
-
-# Import worker
-from parking_monitor_worker import ParkingMonitorWorker
+from routers import health, user_config, streams, esp32, ai_detection, firebase, websocket_streams, detection_viewer, worker_detection_stream, worker_broadcast, detection_logs, tracking_debug
 
 # Global instances
 ai_service = None
 firebase_service = None
 esp32_client = None
-parking_worker = None
 
 # Configuration
 ESP32_URL = os.getenv("ESP32_URL", "http://localhost:5069")
-ENABLE_PARKING_MONITOR = os.getenv("ENABLE_PARKING_MONITOR", "true").lower() == "true"
-MONITOR_CHECK_INTERVAL = int(os.getenv("MONITOR_CHECK_INTERVAL", "5"))
+# ❌ WORKER SHOULD RUN IN SEPARATE PROCESS - DO NOT START HERE!
+# Use: python parking_monitor_worker.py --fps 20
+ENABLE_PARKING_MONITOR = False  # Always False - worker must run separately
+MONITOR_CHECK_INTERVAL = int(os.getenv("MONITOR_CHECK_INTERVAL", "10"))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifecycle manager - load models on server start"""
-    global ai_service, firebase_service, esp32_client, parking_worker
+    global ai_service, firebase_service, esp32_client
     
     print("🚀 Starting FastAPI SmartParking Server...")
     
@@ -87,28 +86,17 @@ async def lifespan(app: FastAPI):
     ai_detection.init_router(ai_service, firebase_service)
     firebase.init_router(firebase_service)
     
-    # Start parking monitor worker (optional)
-    if ENABLE_PARKING_MONITOR and firebase_service:
-        print(f"👁️  Starting parking monitor worker (interval: {MONITOR_CHECK_INTERVAL}s)...")
-        parking_worker = ParkingMonitorWorker(
-            check_interval=MONITOR_CHECK_INTERVAL,
-            detection_url="http://localhost:8069"
-        )
-        # Start worker in background
-        asyncio.create_task(parking_worker.start())
-        print("✅ Parking monitor worker started")
-    elif not ENABLE_PARKING_MONITOR:
-        print("⏸️  Parking monitor worker disabled (set ENABLE_PARKING_MONITOR=true to enable)")
+    # ⚠️  NOTE: Parking monitor worker should run in SEPARATE PROCESS
+    # Run: python parking_monitor_worker.py --fps 20
+    print("=" * 60)
+    print("⚠️  To start the worker (separate process), run:")
+    print("   cd server && python parking_monitor_worker.py --fps 20")
+    print("=" * 60)
     
     yield  # Server runs here
     
     # Cleanup on shutdown
     print("🛑 Shutting down server...")
-    
-    # Stop parking worker
-    if parking_worker:
-        print("🛑 Stopping parking monitor worker...")
-        parking_worker.stop()
     
     # Stop all broadcasters
     print("📡 Stopping broadcasters...")
@@ -140,11 +128,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount static files directory for serving HTML/CSS/JS files
+static_dir = Path(__file__).parent / "static"
+static_dir.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
 # Include all routers
 app.include_router(health.router)
 app.include_router(user_config.router)
 app.include_router(streams.router)
 app.include_router(websocket_streams.router)
+app.include_router(detection_viewer.router)
+app.include_router(worker_detection_stream.router)
+app.include_router(worker_broadcast.router)
+app.include_router(detection_logs.router)
+app.include_router(tracking_debug.router)  # Debug tracking information
 app.include_router(esp32.router)
 app.include_router(ai_detection.router)
 app.include_router(firebase.router)
@@ -156,7 +154,8 @@ if __name__ == "__main__":
     print(f"📹 ESP32-CAM: {ESP32_URL}")
     print(f"🌐 Backend Server: http://localhost:8069")
     print(f"📖 API Docs: http://localhost:8069/docs")
-    print(f"💡 Start ESP32 server: cd ESP32 && python start_mock.py --port 5069")
+    print(f"� Tracking Debug UI: http://localhost:8069/static/tracking_debug.html")
+    print(f"�💡 Start ESP32 server: cd ESP32 && python start_mock.py --port 5069")
     print("=" * 60)
     
     uvicorn.run(
@@ -164,5 +163,6 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8069,
         reload=True,
+        # reload=False,  # ✅ Disabled auto-reload to prevent shutdown when worker runs
         log_level="info"
     )

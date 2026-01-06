@@ -16,6 +16,8 @@ import { PlateHistoryPage } from './pages/PlateHistoryPage';
 import { ObjectTrackingPage } from './pages/ObjectTrackingPage';
 import { ParkingLotManagementPage } from './pages/ParkingLotManagementPage';
 import { ParkingSpaceEditorPage } from './pages/ParkingSpaceEditorPage';
+import { WorkerMonitorPage } from './pages/WorkerMonitorPage';
+import DetectionViewerPage from './pages/DetectionViewerPage';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { useAuth } from './context/AuthContext';
 
@@ -251,6 +253,40 @@ function App() {
                 </NavLink>
               )}
 
+              {/* 11.6. Worker Monitor */}
+              {user && role === 'admin' && (
+                <NavLink
+                  to="/worker-monitor"
+                  className={({ isActive }) =>
+                    `flex items-center ${sidebarOpen ? 'gap-3 px-4' : 'justify-center px-2'} py-3 rounded-lg font-medium transition-all ${
+                      isActive
+                        ? 'bg-purple-200 text-purple-900 border border-purple-500 shadow-inner'
+                        : 'bg-white text-purple-700 border border-purple-100 hover:bg-purple-50'
+                    }`
+                  }
+                >
+                  <span className="text-xl flex-shrink-0">🖥️</span>
+                  {sidebarOpen && <span className="truncate">Worker Monitor</span>}
+                </NavLink>
+              )}
+
+              {/* 11.7. Detection Viewer */}
+              {user && (
+                <NavLink
+                  to="/detection-viewer"
+                  className={({ isActive }) =>
+                    `flex items-center ${sidebarOpen ? 'gap-3 px-4' : 'justify-center px-2'} py-3 rounded-lg font-medium transition-all ${
+                      isActive
+                        ? 'bg-blue-200 text-blue-900 border border-blue-500 shadow-inner'
+                        : 'bg-white text-blue-700 border border-blue-100 hover:bg-blue-50'
+                    }`
+                  }
+                >
+                  <span className="text-xl flex-shrink-0">📺</span>
+                  {sidebarOpen && <span className="truncate">Live Detection</span>}
+                </NavLink>
+              )}
+
               {/* 12. Account */}
               {user && (
                 <NavLink
@@ -437,7 +473,23 @@ function App() {
               </ProtectedRoute>
             } 
           />
-          </Routes>
+          <Route 
+            path="/worker-monitor" 
+            element={
+              <ProtectedRoute roles={['admin']}>
+                <WorkerMonitorPage />
+              </ProtectedRoute>
+            } 
+          />
+          <Route 
+            path="/detection-viewer" 
+            element={
+              <ProtectedRoute>
+                <DetectionViewerPage />
+              </ProtectedRoute>
+            } 
+          />
+        </Routes>
         </main>
       </div>
     </BrowserRouter>

@@ -192,6 +192,7 @@ async def proxy_custom_esp32_stream(
 @router.get("/detect")
 async def stream_with_detection(
     request: Request,
+    camera_url: Optional[str] = Query(None, description="Direct camera URL (e.g., http://192.168.1.100)"),
     conf: float = Query(0.25, description="Confidence threshold"),
     show_labels: bool = Query(True, description="Show detection labels"),
     fps: int = Query(10, description="Target FPS", ge=1, le=30),
@@ -202,14 +203,25 @@ async def stream_with_detection(
     Stream ESP32 with real-time object detection
     🎥 BROADCAST MODE: Uses same frame feed as raw stream (synced frame IDs)
     
-    Performance parameters:
+    Query parameters:
+    - camera_url: Direct camera URL (priority over user_id and default)
+    - conf: Confidence threshold (default 0.25)
+    - show_labels: Show detection labels (default true)
     - fps: Target FPS (default 10, range 1-30)
     - skip_frames: Process every Nth frame (default 2)
+    
+    Usage:
+    - http://localhost:8069/stream/detect?camera_url=http://192.168.1.100
+    - http://localhost:8069/stream/detect?camera_url=http://localhost:8083&fps=15&conf=0.5
     """
-    # Determine which ESP32 URL to use
+    # Determine which ESP32 URL to use (priority: camera_url > user config > default)
     stream_source_url = ESP32_URL
     
-    if user_id and firebase_service:
+    if camera_url:
+        # Direct camera URL parameter takes priority
+        stream_source_url = camera_url
+        print(f"📹 Using provided camera URL: {stream_source_url}")
+    elif user_id and firebase_service:
         try:
             config = await firebase_service.get_user_esp32_config(user_id)
             if config and config.get("esp32_url"):
@@ -217,6 +229,12 @@ async def stream_with_detection(
                 print(f"📹 Using user's ESP32 for detection: {stream_source_url}")
         except Exception as e:
             print(f"⚠️  Could not get user ESP32 config: {e}, using default")
+    
+    if not stream_source_url:
+        raise HTTPException(
+            status_code=400,
+            detail="No camera URL provided. Use camera_url parameter or provide X-User-ID header with configured camera."
+        )
     
     stream_url = f"{stream_source_url}/stream"
     client_id = str(uuid.uuid4())[:8]
@@ -342,6 +360,237 @@ async def stream_with_detection(
     
     return StreamingResponse(
         generate_detected_stream(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+    )
+
+
+@router.get("/tracking")
+async def stream_with_tracking(
+    request: Request,
+    camera_url: Optional[str] = Query(None, description="Direct camera URL (e.g., http://192.168.1.100)"),
+    conf: float = Query(0.25, description="Confidence threshold"),
+    show_labels: bool = Query(True, description="Show detection labels"),
+    show_trails: bool = Query(True, description="Show tracking trails"),
+    fps: int = Query(10, description="Target FPS", ge=1, le=30),
+    skip_frames: int = Query(1, description="Process every Nth frame", ge=1, le=10),
+    user_id: Optional[str] = Header(None, alias="X-User-ID")
+):
+    """
+    Stream ESP32 with real-time ByteTrack object tracking
+    🎯 DEBUG ENDPOINT: Monitor multi-object tracking with trails and track IDs
+    
+    Query parameters:
+    - camera_url: Direct camera URL (priority over user_id and default)
+    - conf: Confidence threshold (default 0.25)
+    - show_labels: Show track IDs and labels (default true)
+    - show_trails: Show tracking trails (default true)
+    - fps: Target FPS (default 10, range 1-30)
+    - skip_frames: Process every Nth frame (default 1 for tracking)
+    
+    Usage:
+    - http://localhost:8069/stream/tracking?camera_url=http://192.168.1.100
+    - http://localhost:8069/stream/tracking?camera_url=http://localhost:5069&fps=15&conf=0.3
+    
+    Features:
+    - ✅ ByteTrack multi-object tracking
+    - ✅ Persistent track IDs across frames
+    - ✅ Tracking trails visualization
+    - ✅ Track statistics overlay
+    - ✅ Color-coded tracks
+    """
+    # Determine which ESP32 URL to use
+    stream_source_url = ESP32_URL
+    
+    if camera_url:
+        stream_source_url = camera_url
+        print(f"📹 Using provided camera URL for tracking: {stream_source_url}")
+    elif user_id and firebase_service:
+        try:
+            config = await firebase_service.get_user_esp32_config(user_id)
+            if config and config.get("esp32_url"):
+                stream_source_url = config["esp32_url"]
+                print(f"📹 Using user's ESP32 for tracking: {stream_source_url}")
+        except Exception as e:
+            print(f"⚠️  Could not get user ESP32 config: {e}, using default")
+    
+    if not stream_source_url:
+        raise HTTPException(
+            status_code=400,
+            detail="No camera URL provided. Use camera_url parameter or provide X-User-ID header."
+        )
+    
+    stream_url = f"{stream_source_url}/stream"
+    client_id = str(uuid.uuid4())[:8]
+    
+    # Get or create broadcaster
+    broadcaster = await broadcast_manager.get_broadcaster(stream_url)
+    queue = await broadcaster.subscribe_raw()
+    
+    # Track statistics
+    track_stats = {
+        'active_tracks': set(),
+        'total_tracks_seen': set(),
+        'frames_with_tracks': 0
+    }
+    
+    async def generate_tracking_stream():
+        """Generate ByteTrack tracking stream"""
+        try:
+            print(f"🎯 [Track {client_id}] Connected | FPS:{fps} | Skip:{skip_frames} | Conf:{conf}")
+            
+            frames_received = 0
+            frames_processed = 0
+            frames_sent = 0
+            last_send_time = asyncio.get_event_loop().time()
+            min_frame_interval = 1.0 / fps if fps > 0 else 0
+            
+            while True:
+                # Check disconnect
+                if await request.is_disconnected():
+                    print(f"🔌 [Track {client_id}] Disconnected")
+                    break
+                
+                try:
+                    # Wait for frame
+                    frame = await asyncio.wait_for(queue.get(), timeout=5.0)
+                    
+                    if frame is None:
+                        print(f"🔴 [Track {client_id}] Broadcast ended")
+                        break
+                    
+                    frames_received += 1
+                    
+                    # Skip frames filter
+                    if (frames_received % skip_frames) != 0:
+                        continue
+                    
+                    # FPS throttle
+                    current_time = asyncio.get_event_loop().time()
+                    time_since_last_send = current_time - last_send_time
+                    
+                    if time_since_last_send >= min_frame_interval:
+                        process_start = current_time
+                        
+                        # Decode frame
+                        nparr = np.frombuffer(frame.jpeg_data, np.uint8)
+                        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        
+                        if img is not None:
+                            # Run ByteTrack tracking
+                            detections = await ai_service.detect_objects(
+                                img,
+                                conf_threshold=conf,
+                                iou_threshold=0.45,
+                                use_tracking=True  # Enable ByteTrack
+                            )
+                            
+                            # Draw detections with trails
+                            annotated_frame = ai_service.draw_detections(
+                                img,
+                                detections,
+                                show_trails=show_trails,
+                                show_track_id=show_labels
+                            )
+                            
+                            # Update track statistics
+                            current_tracks = {det['track_id'] for det in detections if det.get('track_id') is not None}
+                            if current_tracks:
+                                track_stats['active_tracks'] = current_tracks
+                                track_stats['total_tracks_seen'].update(current_tracks)
+                                track_stats['frames_with_tracks'] += 1
+                            
+                            # Draw statistics overlay
+                            if show_labels:
+                                stats_y = 30
+                                stats_lines = [
+                                    f"Frame: {frames_processed}",
+                                    f"Active Tracks: {len(current_tracks)}",
+                                    f"Total Tracks: {len(track_stats['total_tracks_seen'])}",
+                                    f"Detections: {len(detections)}",
+                                    f"FPS: {1.0/time_since_last_send if time_since_last_send > 0 else 0:.1f}"
+                                ]
+                                
+                                for line in stats_lines:
+                                    cv2.putText(
+                                        annotated_frame,
+                                        line,
+                                        (10, stats_y),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.6,
+                                        (255, 255, 255),
+                                        2
+                                    )
+                                    cv2.putText(
+                                        annotated_frame,
+                                        line,
+                                        (10, stats_y),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.6,
+                                        (0, 0, 0),
+                                        1
+                                    )
+                                    stats_y += 25
+                            
+                            # Encode to JPEG
+                            _, jpeg_encoded = cv2.imencode('.jpg', annotated_frame,
+                                                            [cv2.IMWRITE_JPEG_QUALITY, 80])
+                            
+                            process_time = asyncio.get_event_loop().time() - process_start
+                            
+                            # Send frame
+                            try:
+                                yield (
+                                    b"--frame\r\n"
+                                    b"Content-Type: image/jpeg\r\n\r\n" +
+                                    jpeg_encoded.tobytes() + b"\r\n"
+                                )
+                                
+                                frames_processed += 1
+                                frames_sent += 1
+                                last_send_time = current_time
+                                
+                                if frames_sent == 1:
+                                    print(f"✅ [Track {client_id}] Started tracking (Frame {frame.frame_id})")
+                                elif frames_sent % 30 == 0:
+                                    actual_fps = 1.0 / time_since_last_send if time_since_last_send > 0 else 0
+                                    print(f"🎯 [Track {client_id}] Frame {frames_sent} | "
+                                          f"Active: {len(current_tracks)} | "
+                                          f"Total Seen: {len(track_stats['total_tracks_seen'])} | "
+                                          f"FPS: {actual_fps:.1f} | "
+                                          f"Process: {process_time*1000:.1f}ms")
+                            
+                            except Exception as e:
+                                print(f"🔌 [Track {client_id}] Write failed: {type(e).__name__}")
+                                break
+                
+                except asyncio.TimeoutError:
+                    print(f"⏱️  [Track {client_id}] Frame timeout")
+                    continue
+        
+        except Exception as e:
+            print(f"❌ [Track {client_id}] Error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Unsubscribe
+            broadcaster.unsubscribe(queue)
+            print(f"🧹 [Track {client_id}] Cleanup | "
+                  f"Frames: {frames_sent} | "
+                  f"Unique Tracks: {len(track_stats['total_tracks_seen'])}")
+            
+            # Reset tracking state for this client
+            ai_service.reset_tracking()
+            
+            # Cleanup inactive broadcasters
+            await broadcast_manager.cleanup_inactive()
+    
+    return StreamingResponse(
+        generate_tracking_stream(),
         media_type="multipart/x-mixed-replace; boundary=frame",
         headers={
             "Cache-Control": "no-cache, no-store, must-revalidate",

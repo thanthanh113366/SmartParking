@@ -10,6 +10,8 @@ export interface ESP32Config {
   updatedAt: Date;
   isDefault?: boolean; // Mark as default ESP32
   workerEnabled?: boolean; // Enable background worker monitoring for this camera
+  workerActive?: boolean; // Whether worker is currently processing this camera
+  lastWorkerUpdate?: string; // ISO timestamp of last worker update
 }
 
 /**
@@ -76,6 +78,7 @@ export async function getUserESP32Configs(userId: string): Promise<ESP32Config[]
         createdAt: new Date(data.createdAt),
         updatedAt: new Date(data.updatedAt),
         isDefault: data.isDefault || false,
+        workerEnabled: data.workerEnabled || false,
       });
     });
     
