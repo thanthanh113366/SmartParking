@@ -4,7 +4,7 @@ Continuously monitors active cameras and updates parking space occupancy
 """
 import asyncio
 import aiohttp
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Optional
 from datetime import datetime
 import logging
 from pathlib import Path
@@ -92,6 +92,10 @@ class ParkingMonitorWorker:
         self.parking_service = ParkingSpaceService(self.firebase_service)
         self.ai_service = AIService()
         
+        # Import VehiclePlateService for plate tracking
+        from services.vehicle_plate_service import VehiclePlateService
+        self.vehicle_plate_service = VehiclePlateService(self.firebase_service)
+        
         # Track active cameras
         self.active_cameras: Set[str] = set()
         self.camera_spaces_cache: Dict[str, List[Dict]] = {}
@@ -109,6 +113,10 @@ class ParkingMonitorWorker:
         # Track last worker status update time
         self.last_worker_status_update: float = 0
         self.worker_status_update_interval: float = 5.0  # Update every 5 seconds
+        
+        # Static plate detection filter (to ignore signs and static objects)
+        self.static_plate_history: Dict[str, Dict[str, int]] = {}  # camera_id -> {plate_text: count}
+        self.static_plate_threshold: int = 10  # If plate appears 10+ times, consider it static
     
     async def load_ai_models(self):
         """Load AI models asynchronously"""
@@ -249,7 +257,8 @@ class ParkingMonitorWorker:
                     
                     # Get cameras for this parking lot
                     camera_ids = lot_data.get('cameras', [])
-                    logger.debug(f"Parking lot {lot_doc.id} has {len(camera_ids)} cameras")
+                    barrier_camera_id = lot_data.get('barrierCamera')  # Get barrier camera ID
+                    logger.debug(f"Parking lot {lot_doc.id} has {len(camera_ids)} cameras, barrier: {barrier_camera_id}")
                     
                     for camera_id in camera_ids:
                         try:
@@ -267,12 +276,16 @@ class ParkingMonitorWorker:
                                     logger.debug(f"Skipping camera with worker disabled: {camera_data.get('name', camera_id)}")
                                     continue
                                 
-                                logger.info(f"Found worker-enabled camera: {camera_data.get('name', camera_id)}")
+                                # Check if this camera is the barrier camera
+                                is_barrier = (camera_id == barrier_camera_id)
+                                
+                                logger.info(f"Found worker-enabled camera: {camera_data.get('name', camera_id)} {'🚧 (BARRIER)' if is_barrier else ''}")
                                 active_cameras.append({
                                     'camera_id': camera_id,
                                     'parking_id': lot_doc.id,
                                     'camera_name': camera_data.get('name', camera_id),
                                     'ip_address': camera_data.get('ipAddress', ''),
+                                    'is_barrier': is_barrier,  # ✅ Flag barrier cameras
                                 })
                             else:
                                 logger.warning(f"Camera config not found: {camera_id}")
@@ -318,21 +331,25 @@ class ParkingMonitorWorker:
                 base_url = camera_url.rstrip('/')
                 capture_url = f'{base_url}/capture'
                 
-                logger.debug(f"Fetching frame from: {capture_url}")
+                logger.debug(f"  → Requesting: {capture_url}")
                 
                 async with session.get(capture_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                     if response.status == 200:
                         image_bytes = await response.read()
-                        logger.debug(f"Fetched {len(image_bytes)} bytes from camera")
+                        logger.debug(f"  ✅ Fetched {len(image_bytes)} bytes")
                         return image_bytes
                     else:
-                        logger.warning(f"Failed to fetch frame from {capture_url}: HTTP {response.status}")
+                        logger.error(f"  ❌ HTTP {response.status} from {capture_url}")
                         return None
         except asyncio.TimeoutError:
-            logger.error(f"Timeout fetching frame from {camera_url}")
+            logger.error(f"  ⏱️  Timeout (10s) fetching from {camera_url}")
+            return None
+        except aiohttp.ClientConnectorError as e:
+            logger.error(f"  ❌ Connection error to {camera_url}: {e}")
+            logger.error(f"     Is the ESP32 server running on this port?")
             return None
         except Exception as e:
-            logger.error(f"Error fetching frame from {camera_url}: {e}")
+            logger.error(f"  ❌ Error fetching from {camera_url}: {type(e).__name__}: {e}")
             return None
     
     async def detect_vehicles_in_frame(self, image_input) -> List[Dict]:
@@ -406,6 +423,8 @@ class ParkingMonitorWorker:
         camera_id = camera_info['camera_id']
         parking_id = camera_info['parking_id']
         camera_url = camera_info['ip_address']
+        camera_name = camera_info.get('camera_name', camera_id)
+        is_barrier_camera = camera_info.get('is_barrier', False)
         
         try:
             # Rate limiting: skip if processed too recently
@@ -419,27 +438,22 @@ class ParkingMonitorWorker:
             
             self.last_processed[camera_id] = current_time
             
-            logger.debug(f"Processing camera: {camera_info['camera_name']} ({camera_id})")
-
-            
             # Get parking spaces for this camera (use cache)
             if camera_id not in self.camera_spaces_cache:
                 spaces = self.parking_service.get_parking_spaces_by_camera(camera_id)
                 self.camera_spaces_cache[camera_id] = spaces
-                logger.info(f"✅ Loaded {len(spaces)} parking spaces for camera {camera_id}")
             else:
                 spaces = self.camera_spaces_cache[camera_id]
             
             if not spaces:
-                logger.warning(f"No parking spaces defined for camera {camera_id}")
-                # Send an info message to UI about missing parking spaces
+                logger.warning(f"⚠️ {camera_name:<25} | No parking spaces defined")
                 await self.broadcast_no_spaces_message(camera_id, camera_info.get('camera_name', camera_id))
                 return
             
             # Fetch frame from camera
             frame_bytes = await self.fetch_camera_frame(camera_url)
             if not frame_bytes:
-                logger.warning(f"Could not fetch frame from {camera_url}")
+                logger.error(f"❌ {camera_name:<25} | Could not fetch frame (check ESP32)")
                 return
             
             # Decode image first to check if valid
@@ -449,15 +463,34 @@ class ParkingMonitorWorker:
             frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
             
             if frame is None:
-                logger.error(f"Failed to decode image from {camera_url} - invalid image data")
+                logger.error(f"❌ {camera_name:<25} | Invalid image data")
                 return
             
             image_height, image_width = frame.shape[:2]
-            logger.debug(f"Frame dimensions: {image_width}x{image_height}")
+            
+            # Barrier cameras now use normal tracking - ALPR triggered manually from UI
             
             # Detect vehicles (pass the decoded frame, not bytes)
             detections = await self.detect_vehicles_in_frame(frame)
-            logger.debug(f"🚗 Detected {len(detections)} vehicles in camera {camera_id}")
+            
+            # 🆕 Track vehicle plates and update parking space assignments
+            if self.use_tracking and detections:
+                # Get active track IDs
+                active_track_ids = [d.get('track_id') for d in detections if d.get('track_id') is not None]
+                
+                # Cleanup lost tracks
+                self.vehicle_plate_service.cleanup_lost_tracks(camera_id, active_track_ids)
+                
+                # For each tracked vehicle, add plate info if available
+                for det in detections:
+                    track_id = det.get('track_id')
+                    if track_id is None:
+                        continue
+                    
+                    # Get assigned plate for this vehicle
+                    plate = self.vehicle_plate_service.get_vehicle_plate(camera_id, track_id)
+                    if plate:
+                        det['plate'] = plate  # Add plate to detection info
             
             # Match detections to parking spaces
             matched_detections, space_occupancy = self.parking_service.match_detections_to_spaces(
@@ -465,8 +498,17 @@ class ParkingMonitorWorker:
                 parking_spaces=spaces,
                 image_width=image_width,
                 image_height=image_height,
-                iou_threshold=0.5
+                iou_threshold=0.3,  # Lower threshold works better with IoA
+                use_ioa=True,  # ✅ Use IoA instead of IoU
+                ioa_mode='detection'  # What % of car is in parking space?
             )
+            
+            # Beautiful aligned log
+            num_vehicles = len(detections)
+            occupied = sum(space_occupancy.values())
+            total_spaces = len(space_occupancy)
+            
+            logger.info(f"📹 {camera_name:<25} | {num_vehicles:2d} vehicles | {occupied:2d}/{total_spaces:2d} occupied")
             
             # Draw detections and parking spaces on frame for broadcasting
             annotated_frame = self.draw_detections_on_frame(
@@ -490,6 +532,7 @@ class ParkingMonitorWorker:
                         "confidence": det.get('confidence'),
                         "bbox": det.get('bbox'),  # [x, y, width, height]
                         "track_id": det.get('track_id'),  # None if tracking disabled
+                        "plate": det.get('plate'),  # License plate if assigned
                         "center": [
                             det['bbox'][0] + det['bbox'][2] / 2,
                             det['bbox'][1] + det['bbox'][3] / 2
@@ -502,6 +545,7 @@ class ParkingMonitorWorker:
                         "space_id": space['id'],
                         "space_name": space.get('name', space['id']),
                         "is_occupied": space_occupancy.get(space['id'], False),
+                        "vehicle_plate": self._get_plate_for_space(space['id'], matched_detections),  # 🆕 Add plate
                         "bbox": {
                             "x": space['x'],
                             "y": space['y'],
@@ -517,7 +561,8 @@ class ParkingMonitorWorker:
                             "class": det.get('class'),
                             "confidence": det.get('confidence'),
                             "bbox": det.get('bbox'),
-                            "track_id": det.get('track_id')
+                            "track_id": det.get('track_id'),
+                            "plate": det.get('plate')  # Include plate in matched detection
                         },
                         "space_id": det.get('parking_space_id'),
                         "space_name": det.get('parking_space_name'),
@@ -528,6 +573,45 @@ class ParkingMonitorWorker:
                 ],
                 "tracking_enabled": self.use_tracking
             }
+            
+            # � EXAM MODE: Disabled automatic assignment on new occupancy
+            # Will use manual ALPR + random assignment to 30s+ occupied spaces instead
+            # �🆕 HEURISTIC: Detect newly occupied spaces and assign plates from queue
+            # newly_occupied_with_plates = self.vehicle_plate_service.detect_new_occupancy(
+            #     camera_id=camera_id,
+            #     parking_id=parking_id,
+            #     current_space_occupancy=space_occupancy,
+            #     spaces=spaces
+            # )
+            
+            # Update Firebase for newly occupied spaces with plates from queue
+            # for new_occ in newly_occupied_with_plates:
+            #     try:
+            #         space_ref = self.firebase_service.db.collection('parkingSpaces').document(new_occ['space_id'])
+            #         space_ref.update({
+            #             'isOccupied': True,
+            #             'vehiclePlate': new_occ['plate'],
+            #             'occupiedAt': new_occ['occupied_at']
+            #         })
+            #         logger.info(f"📝 Updated space {new_occ['space_name']} with plate {new_occ['plate']}")
+            #     except Exception as e:
+            #         logger.error(f"❌ Failed to update space {new_occ['space_id']}: {e}")
+            
+            # 🆕 Update parking space assignments with plate numbers (for tracked vehicles)
+            if self.use_tracking:
+                for det in matched_detections:
+                    track_id = det.get('track_id')
+                    parking_space_id = det.get('parking_space_id')
+                    plate = det.get('plate')
+                    
+                    # If vehicle has a plate and is parked in a space
+                    if track_id and parking_space_id and plate:
+                        await self.vehicle_plate_service.update_vehicle_parking_space(
+                            camera_id=camera_id,
+                            track_id=track_id,
+                            parking_space_id=parking_space_id,
+                            status='parked'
+                        )
             
             # Broadcast annotated frame + tracking info to backend
             await self.broadcast_frame_to_viewers(
@@ -567,6 +651,24 @@ class ParkingMonitorWorker:
             
         except Exception as e:
             logger.error(f"Error processing camera {camera_id}: {e}", exc_info=True)
+    
+    def _get_plate_for_space(self, space_id: str, matched_detections: List[Dict]) -> Optional[str]:
+        """
+        Helper method to get the license plate for a specific parking space
+        
+        Args:
+            space_id: Parking space ID
+            matched_detections: List of matched detections
+        
+        Returns:
+            License plate string or None
+        """
+        for det in matched_detections:
+            if det.get('parking_space_id') == space_id:
+                plate = det.get('plate')
+                if plate:
+                    return plate
+        return None
     
     def draw_detections_on_frame(
         self,
@@ -614,8 +716,21 @@ class ParkingMonitorWorker:
                 # Draw bounding box
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
                 
-                # Draw label
+                # Draw label with plate info if available
                 label = f"{detection.get('class', 'vehicle')}: {detection.get('confidence', 0):.2f}"
+                
+                # Add track ID if tracking enabled
+                if detection.get('track_id') is not None:
+                    label = f"ID:{detection['track_id']} {label}"
+                
+                # Add plate number if available (in GREEN)
+                plate = detection.get('plate')
+                if plate:
+                    label = f"[{plate}] {label}"
+                    # Draw plate in green below the main label
+                    cv2.putText(frame, f"🚗 {plate}", (x1, y1 - 25), cv2.FONT_HERSHEY_SIMPLEX,
+                               0.7, (0, 255, 0), 2, cv2.LINE_AA)
+                
                 cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX,
                            0.5, (255, 0, 0), 1, cv2.LINE_AA)
         
@@ -641,6 +756,14 @@ class ParkingMonitorWorker:
             
             # Draw label with background
             label = f"{space.get('name', space_id)}: {'Occupied' if is_occupied else 'Free'}"
+            
+            # Add plate number if space is occupied and we can find it from detections
+            if is_occupied and detections:
+                for det in detections:
+                    if det.get('parking_space_id') == space_id and det.get('plate'):
+                        label = f"{space.get('name', space_id)}: [{det['plate']}]"
+                        break
+            
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
             
             # Draw text background
@@ -791,6 +914,7 @@ class ParkingMonitorWorker:
                     for cam in active_cameras:
                         logger.info(f"   • {cam['camera_name']} (ID: {cam['camera_id']})")
                         logger.info(f"     URL: {cam['ip_address']}")
+                        logger.info(f"     Parking: {cam['parking_id']}")
                     logger.info(f"🐛 View tracking data: {self.detection_url}/static/tracking_debug.html")
                     logger.info("=" * 80)
                 
