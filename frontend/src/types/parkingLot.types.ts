@@ -18,6 +18,7 @@ export interface ParkingLot {
   
   // Cameras
   cameras: string[];             // ["CAM001", "CAM002", "CAM003"]
+  barrierCamera?: string | null; // Camera ID đóng vai trò barrier (entry/exit detection)
   
   // Metadata
   createdAt: Timestamp;
@@ -29,6 +30,29 @@ export interface ParkingLot {
   openTime?: string;             // "00:00"
   closeTime?: string;            // "23:59"
   description?: string;          // Mô tả bãi đỗ
+}
+
+/**
+ * Parking Space Definition - Collection: parkingSpaceDefinitions
+ * Định nghĩa vị trí các parking spaces trên camera (do user config)
+ */
+export interface ParkingSpaceDefinition {
+  // Space Identity
+  id: string;                    // "space-001"
+  parkingId: string;             // "PARKING_A"
+  cameraId: string;              // "CAM001" or ESP32 config ID
+  name: string;                  // "A1", "A2", "B1" etc.
+  
+  // Location (normalized 0-1 based on image dimensions)
+  x: number;                     // x position (0-1)
+  y: number;                     // y position (0-1)
+  width: number;                 // width (0-1)
+  height: number;                // height (0-1)
+  
+  // Metadata
+  createdAt: Timestamp;
+  updatedAt: Timestamp;
+  createdBy: string;             // User ID who created this space
 }
 
 /**
